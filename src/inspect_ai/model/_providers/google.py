@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import ssl
+from collections.abc import Callable, Mapping
 from copy import copy
 from io import BytesIO
 from logging import getLogger
@@ -459,6 +460,17 @@ class GoogleGenAIAPI(ModelAPI):
             else:
                 http_hooks = HttpHooks(api=self)
             with http_hooks.request() as request_id:
+                # On asyncio google-genai sends requests over aiohttp, which
+                # HttpxHooks can't observe, so record the response headers the
+                # SDK hands back instead (under Trio the hooks see them).
+                sdk_uses_aiohttp = _sdk_uses_aiohttp(client)
+
+                def record_response(
+                    status: int, headers: Mapping[str, str] | None
+                ) -> None:
+                    if sdk_uses_aiohttp and headers is not None:
+                        http_hooks.record_response(request_id, status, headers)
+
                 # Create google-genai types.
                 gemini_contents = await as_chat_messages(
                     client, input, emulate_reasoning=not self.is_gemini_thinking()
@@ -547,6 +559,9 @@ class GoogleGenAIAPI(ModelAPI):
                                 model=self.service_model_name(),
                                 contents=gemini_contents,  # type: ignore[arg-type]
                                 config=parameters,
+                                on_response_headers=lambda headers: record_response(
+                                    200, headers
+                                ),
                             )
                         else:
                             response = await client.aio.models.generate_content(
@@ -554,6 +569,8 @@ class GoogleGenAIAPI(ModelAPI):
                                 contents=gemini_contents,  # type: ignore[arg-type]
                                 config=parameters,
                             )
+                            if response.sdk_http_response is not None:
+                                record_response(200, response.sdk_http_response.headers)
                         attempt_usage = usage_metadata_to_model_usage(
                             response.usage_metadata
                         )
@@ -589,7 +606,10 @@ class GoogleGenAIAPI(ModelAPI):
                         # otherwise we are done
                         else:
                             break
-                except ClientError as ex:
+                except APIError as ex:
+                    record_response(ex.code, _api_error_headers(ex))
+                    if not isinstance(ex, ClientError):
+                        raise
                     model_call.set_error(
                         {"error": {"message": str(ex.message), "code": ex.code}},
                         http_hooks.end_request(request_id),
@@ -627,12 +647,16 @@ class GoogleGenAIAPI(ModelAPI):
         model: str,
         contents: list[ContentUnion],
         config: GenerateContentConfig,
+        on_response_headers: Callable[[Mapping[str, str]], None] | None = None,
     ) -> GenerateContentResponse:
         """Stream content generation and accumulate response.
 
         Accumulates parts from streaming chunks and constructs a response
         that matches non-streaming structure, allowing existing parsing logic
         to handle the conversion to Inspect format.
+
+        `on_response_headers` is called once with the headers of the
+        streamed HTTP response, when the SDK provides them.
 
         Raises:
             RuntimeError: If no chunks received from stream
@@ -649,6 +673,13 @@ class GoogleGenAIAPI(ModelAPI):
         report_model_stream_start()
 
         async for chunk in stream:
+            if (
+                last_chunk is None
+                and on_response_headers is not None
+                and chunk.sdk_http_response is not None
+                and chunk.sdk_http_response.headers is not None
+            ):
+                on_response_headers(chunk.sdk_http_response.headers)
             last_chunk = chunk
 
             # report cumulative output tokens when the chunk carries usage
@@ -1354,6 +1385,23 @@ class GoogleGenAIAPI(ModelAPI):
             ),
             self.service_model_name(),
         )
+
+
+def _sdk_uses_aiohttp(client: Client) -> bool:
+    """Whether the SDK sends this client's async requests over aiohttp."""
+    use_aiohttp = getattr(client._api_client, "_use_aiohttp", None)
+    return bool(use_aiohttp()) if callable(use_aiohttp) else False
+
+
+def _api_error_headers(ex: APIError) -> dict[str, str] | None:
+    """The response headers of a failed call (aiohttp or httpx response)."""
+    headers = getattr(ex.response, "headers", None)
+    if headers is None:
+        return None
+    try:
+        return {str(name): str(value) for name, value in headers.items()}
+    except Exception:
+        return None
 
 
 def safety_settings_to_list(
